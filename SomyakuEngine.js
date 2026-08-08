@@ -562,44 +562,6 @@ function defaultVelocityForCode(code) {
     return own(velocities, code) ? velocities[code] : 80;
 }
 
-function performanceDefaultVelocityForCode(code) {
-    var velocities = {
-        pppppp: 1,
-        ppppp: 5,
-        pppp: 10,
-        ppp: 19,
-        pp: 32,
-        p: 46,
-        mp: 56,
-        m: 92,
-        mf: 74,
-        f: 92,
-        ff: 108,
-        fff: 122,
-        ffff: 127,
-        fffff: 127,
-        ffffff: 127,
-        n: 46,
-        fp: 92,
-        pf: 46,
-        sf: 108,
-        sfz: 108,
-        sff: 122,
-        sffz: 122,
-        sfff: 127,
-        sfffz: 127,
-        sfp: 108,
-        sfpp: 108,
-        rf: 108,
-        rfz: 108,
-        fz: 108,
-        r: 108,
-        s: 108,
-        z: 74
-    };
-    return own(velocities, code) ? velocities[code] : 80;
-}
-
 function baselineVelocityForCode(code, baselines) {
     var normalizedCode = normalizeDynamicCode(code);
     var values = normalizedBaselines(
@@ -1876,7 +1838,6 @@ function classifyPieceCharacter(measures, events, dynamicEvents, baselines,
     var totalBeats = 0;
     var silentMeasures = 0;
     var attackEvents = 0;
-    var attackedNotes = 0;
     var chordEvents = 0;
     var shortEvents = 0;
     var sustainedEvents = 0;
@@ -1910,7 +1871,6 @@ function classifyPieceCharacter(measures, events, dynamicEvents, baselines,
             continue;
         }
         ++attackEvents;
-        attackedNotes += attacked;
         if (attacked >= 2) {
             ++chordEvents;
         }
@@ -3950,20 +3910,11 @@ function prepareCrossStaffRoles(events, measures, division, options) {
         var moment = bucket.moments[momentKey];
         if (!own(moment.staffs, staffKey)) {
             moment.staffs[staffKey] = {
-                position: descriptor.position,
-                top: event._topPitch,
-                bottom: event._bottomPitch,
-                chordTotal: 0,
-                eventCount: 0
+                top: event._topPitch
             };
         }
         var momentStaff = moment.staffs[staffKey];
         momentStaff.top = Math.max(momentStaff.top, event._topPitch);
-        momentStaff.bottom = momentStaff.bottom < 0
-                ? event._bottomPitch
-                : Math.min(momentStaff.bottom, event._bottomPitch);
-        momentStaff.chordTotal += numberOr(event._attackedCount, 0);
-        ++momentStaff.eventCount;
     }
 
     var decisionsByPart = {};

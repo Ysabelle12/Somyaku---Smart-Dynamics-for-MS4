@@ -66,7 +66,7 @@ MuseScore {
             30, Math.round(ui.theme.largeBodyFont.pixelSize * 2.0))
     readonly property int dynamicsGlyphBoxWidth: 42
     readonly property int dynamicsGlyphBoxHeight: 34
-    readonly property int languageSelectorWidth: 208
+    readonly property int languageSelectorWidth: 192
     readonly property int museScoreDefaultsCheckboxWidth: 440
     property int mainTabIndex: 0
     property int processingMeasureNumber: 0
@@ -141,19 +141,6 @@ MuseScore {
 
     function characterText(character) {
         return trText("character." + String(character || "balanced"));
-    }
-
-    function languageDisplayName(mode) {
-        var names = {
-            ja: "日本語", en: "English", de: "Deutsch", fr: "Français",
-            pt: "Português", it: "Italiano", nl: "Nederlands",
-            es: "Español", ko: "한국어", pl: "Polski",
-            zh_TW: "繁體中文", zh_CN: "简体中文", sv: "Svenska",
-            ru: "Русский"
-        };
-        var selected = String(mode || languageMode);
-        return selected === "auto" ? trText("language.auto")
-                                     : names[selected];
     }
 
     function languageDropdownModel() {
