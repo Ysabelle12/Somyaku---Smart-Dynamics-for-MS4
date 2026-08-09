@@ -60,20 +60,23 @@ MuseScore {
     property string confirmationAction: ""
     property string pendingPresetSwitchKind: ""
     property int pendingPresetSwitchIndex: -1
+    property string renamePresetErrorKey: ""
     property bool allowHostWindowClose: false
     property string lastAppliedSettingsSignature: ""
     readonly property int dynamicsGlyphPixelSize: Math.max(
             30, Math.round(ui.theme.largeBodyFont.pixelSize * 2.0))
     readonly property int dynamicsGlyphBoxWidth: 42
     readonly property int dynamicsGlyphBoxHeight: 34
-    readonly property int languageSelectorWidth: 192
+    readonly property int languageSelectorWidth: 272
     readonly property int museScoreDefaultsCheckboxWidth: 440
     property int mainTabIndex: 0
     property int processingMeasureNumber: 0
     property string processingNoteLabel: ""
     property string languageMode: "auto"
+    readonly property string detectedLanguage: normalizedLanguageCode(
+            Qt.locale().name)
     readonly property string effectiveLanguage: languageMode === "auto"
-            ? normalizedLanguageCode(Qt.locale().name)
+            ? detectedLanguage
             : normalizedLanguageCode(languageMode)
 
     Settings {
@@ -143,9 +146,35 @@ MuseScore {
         return trText("character." + String(character || "balanced"));
     }
 
+    function languageDisplayName(language) {
+        var names = {
+            ja: "日本語",
+            en: "English",
+            de: "Deutsch",
+            fr: "Français",
+            pt: "Português",
+            it: "Italiano",
+            nl: "Nederlands",
+            es: "Español",
+            ko: "한국어",
+            pl: "Polski",
+            zh_TW: "繁體中文",
+            zh_CN: "简体中文",
+            sv: "Svenska",
+            ru: "Русский"
+        };
+        var code = normalizedLanguageCode(language);
+        return own(names, code) ? names[code] : names.en;
+    }
+
     function languageDropdownModel() {
         return [
-            { text: trText("language.auto"), value: "auto" },
+            {
+                text: trFormat(
+                          "language.auto",
+                          [languageDisplayName(detectedLanguage)]),
+                value: "auto"
+            },
             { text: "日本語", value: "ja" },
             { text: "English", value: "en" },
             { text: "Deutsch", value: "de" },
@@ -664,6 +693,58 @@ MuseScore {
         presetModified = false;
         setLocalizedStatus("status.customPresetUpdated", [updated.name]);
         return true;
+    }
+
+    function requestCustomPresetRename() {
+        var selected = selectedCustomPresetIndex;
+        if (selected < 0 || selected >= customPresets.length) {
+            return;
+        }
+        renamePresetErrorKey = "";
+        renamePresetField.currentText = customPresets[selected].name;
+        renamePresetDialog.open();
+        Qt.callLater(function() {
+            renamePresetField.ensureActiveFocus();
+            renamePresetField.selectAll();
+        });
+    }
+
+    function confirmCustomPresetRename() {
+        var selected = selectedCustomPresetIndex;
+        if (selected < 0 || selected >= customPresets.length) {
+            renamePresetDialog.close();
+            return false;
+        }
+        var name = String(renamePresetField.currentText || "")
+                .replace(/^\s+|\s+$/g, "");
+        if (name.length === 0) {
+            renamePresetErrorKey = "error.presetNameRequired";
+            return false;
+        }
+        if (name.length > 48) {
+            name = name.slice(0, 48);
+        }
+        var current = customPresets[selected];
+        var renamed = sanitizedCustomPreset({
+            name: name,
+            baseProfile: current.baseProfile,
+            shaping: current.shaping,
+            baselines: current.baselines
+        }, selected);
+        var next = customPresets.slice(0);
+        next[selected] = renamed;
+        customPresets = next;
+        persistCustomPresets();
+        customPresetBox.currentIndex = selected + 1;
+        renamePresetErrorKey = "";
+        renamePresetDialog.close();
+        setLocalizedStatus("status.customPresetRenamed", [renamed.name]);
+        return true;
+    }
+
+    function cancelCustomPresetRename() {
+        renamePresetErrorKey = "";
+        renamePresetDialog.close();
     }
 
     function loadCustomPreset(index) {
@@ -1695,11 +1776,14 @@ MuseScore {
         for (i = 0; i < scope.selectedElements.length; ++i) {
             var selected = scope.selectedElements[i];
             if (sameScoreObject(selected, metadata.note)
-                    || sameScoreObject(selected, metadata.chord)) {
+                    || sameScoreObject(selected, metadata.chord)
+                    || sameScoreObject(selected, metadata.principalChord)) {
                 return true;
             }
             try {
-                if (sameScoreObject(selected.parent, metadata.chord)) {
+                if (sameScoreObject(selected.parent, metadata.chord)
+                        || sameScoreObject(selected.parent,
+                                           metadata.principalChord)) {
                     return true;
                 }
             } catch (parentError) {
@@ -2492,9 +2576,74 @@ MuseScore {
         };
     }
 
-    function noteKey(tick, track, pitch, noteIndex) {
-        return String(tick) + ":" + String(track) + ":"
+    function noteKey(tick, track, pitch, noteIndex,
+                     gracePlacement, graceChordIndex) {
+        var key = String(tick) + ":" + String(track) + ":"
                 + String(pitch) + ":" + String(noteIndex);
+        if (String(gracePlacement || "").length > 0) {
+            key += ":grace:" + String(gracePlacement)
+                    + ":" + String(graceChordIndex);
+        }
+        return key;
+    }
+
+    function appendChordNoteEntries(entries, chord, principalChord,
+                                    tick, track, placement,
+                                    chordIndex, chordCount, segment) {
+        if (!chord || !chord.notes) {
+            return;
+        }
+        var isGrace = String(placement || "").length > 0;
+        var graceKind = "";
+        if (isGrace) {
+            graceKind = Number(chord.noteType)
+                    === Number(NoteType.ACCIACCATURA)
+                    ? "acciaccatura" : "appoggiatura";
+        }
+        var chordArticulations = isGrace
+                ? articulationNamesForChord(chord, segment) : [];
+        var i;
+        for (i = 0; i < chord.notes.length; ++i) {
+            var note = chord.notes[i];
+            entries.push({
+                key: noteKey(tick, track, note.pitch, i,
+                             placement, chordIndex),
+                note: note,
+                chord: chord,
+                principalChord: principalChord,
+                pitch: Number(note.pitch),
+                noteIndex: i,
+                tied: !!note.tieBack,
+                isGrace: isGrace,
+                graceKind: graceKind,
+                gracePlacement: String(placement || ""),
+                graceChordIndex: Number(chordIndex),
+                graceChordCount: Number(chordCount),
+                graceChordNoteIndex: i,
+                graceChordNoteCount: chord.notes.length,
+                articulations: chordArticulations
+            });
+        }
+    }
+
+    function chordNoteEntries(principalChord, tick, track, segment) {
+        var entries = [];
+        var before = principalChord.graceNotesBefore || [];
+        var after = principalChord.graceNotesAfter || [];
+        var i;
+        for (i = 0; i < before.length; ++i) {
+            appendChordNoteEntries(entries, before[i], principalChord,
+                                   tick, track, "before",
+                                   i, before.length, segment);
+        }
+        appendChordNoteEntries(entries, principalChord, principalChord,
+                               tick, track, "", 0, 0, segment);
+        for (i = 0; i < after.length; ++i) {
+            appendChordNoteEntries(entries, after[i], principalChord,
+                                   tick, track, "after",
+                                   i, after.length, segment);
+        }
+        return entries;
     }
 
     function collectSpannerContext(measures) {
@@ -2652,6 +2801,7 @@ MuseScore {
                     }
 
                     var notes = [];
+                    var graceNotes = [];
                     var staffIndex = Math.floor(track / 4);
                     var partGroup = staffIndex >= 0
                             && staffIndex < partGroups.length
@@ -2664,20 +2814,36 @@ MuseScore {
                     var staffMove = chordStaffMove(element);
                     var displayStaff = clamp(staffIndex + staffMove,
                                              0, curScore.nstaves - 1);
+                    var noteEntries = chordNoteEntries(
+                                element, segment.tick, track, segment);
                     var i;
-                    for (i = 0; i < element.notes.length; ++i) {
-                        var note = element.notes[i];
+                    for (i = 0; i < noteEntries.length; ++i) {
+                        var entry = noteEntries[i];
+                        var note = entry.note;
                         processingNoteLabel = midiNoteName(note.pitch)
                                 + " · S" + (staffIndex + 1)
                                 + "/V" + (track % 4 + 1);
-                        var key = noteKey(segment.tick, track, note.pitch, i);
-                        notes.push({
-                            key: key,
+                        var modelNote = {
+                            key: entry.key,
                             pitch: Number(note.pitch),
                             tied: !!note.tieBack
-                        });
-                        noteReferences[key] = note;
-                        noteMetadata[key] = {
+                        };
+                        if (entry.isGrace) {
+                            modelNote.graceKind = entry.graceKind;
+                            modelNote.gracePlacement = entry.gracePlacement;
+                            modelNote.graceChordIndex = entry.graceChordIndex;
+                            modelNote.graceChordCount = entry.graceChordCount;
+                            modelNote.graceChordNoteIndex
+                                    = entry.graceChordNoteIndex;
+                            modelNote.graceChordNoteCount
+                                    = entry.graceChordNoteCount;
+                            modelNote.articulations = entry.articulations;
+                            graceNotes.push(modelNote);
+                        } else {
+                            notes.push(modelNote);
+                        }
+                        noteReferences[entry.key] = note;
+                        noteMetadata[entry.key] = {
                             tick: segment.tick,
                             track: track,
                             staff: staffIndex,
@@ -2689,9 +2855,13 @@ MuseScore {
                             scorePartStaffCount: partGroup.staffCount,
                             supportedKeyboard: true,
                             measureIndex: measureIndex,
-                            noteIndex: i,
+                            noteIndex: entry.noteIndex,
+                            isGrace: entry.isGrace,
+                            gracePlacement: entry.gracePlacement,
+                            graceChordIndex: entry.graceChordIndex,
                             note: note,
-                            chord: element
+                            chord: entry.chord,
+                            principalChord: element
                         };
                     }
 
@@ -2711,6 +2881,7 @@ MuseScore {
                         tempoBpm: lastTempoBpm,
                         articulations: articulationNamesForChord(element, segment),
                         notes: notes,
+                        graceNotes: graceNotes,
                         dynamicCode: "mf",
                         dynamicVelocity: 80
                     });
@@ -2959,10 +3130,13 @@ MuseScore {
                 if (!element || element.type !== Element.CHORD) {
                     continue;
                 }
+                var noteEntries = chordNoteEntries(
+                            element, segment.tick, track, segment);
                 var i;
-                for (i = 0; i < element.notes.length; ++i) {
-                    var note = element.notes[i];
-                    var key = noteKey(segment.tick, track, note.pitch, i);
+                for (i = 0; i < noteEntries.length; ++i) {
+                    var entry = noteEntries[i];
+                    var note = entry.note;
+                    var key = entry.key;
                     if (!own(expectedWrites, key)) {
                         continue;
                     }
@@ -3298,10 +3472,13 @@ MuseScore {
                         continue;
                     }
                     ++supportedAttackCount;
+                    var noteEntries = chordNoteEntries(
+                                element, segment.tick, track, segment);
                     var i;
-                    for (i = 0; i < element.notes.length; ++i) {
-                        var note = element.notes[i];
-                        var key = noteKey(segment.tick, track, note.pitch, i);
+                    for (i = 0; i < noteEntries.length; ++i) {
+                        var entry = noteEntries[i];
+                        var note = entry.note;
+                        var key = entry.key;
                         if (own(state.notes, key)) {
                             resetTargets.push({
                                 note: note,
@@ -3663,6 +3840,21 @@ MuseScore {
                                                 transparent: true
                                                 enabled: !busy
                                                 onClicked: saveCustomPreset()
+                                            }
+
+                                            MU.FlatButton {
+                                                id: renameCustomPresetButton
+                                                icon: IconCode.EDIT
+                                                Layout.preferredHeight: 30
+                                                Layout.preferredWidth: height
+                                                toolTipTitle: trText("button.renamePreset")
+                                                Accessible.name: trText("button.renamePreset")
+                                                transparent: true
+                                                enabled: !busy
+                                                         && selectedCustomPresetIndex >= 0
+                                                         && selectedCustomPresetIndex
+                                                            < customPresets.length
+                                                onClicked: requestCustomPresetRename()
                                             }
 
                                             MU.FlatButton {
@@ -4644,7 +4836,7 @@ MuseScore {
                     spacing: 2
 
                     MU.StyledTextLabel {
-                        text: "v1.0 · © 2026 花火 ch. / Pandas213"
+                        text: "v1.0.0 · © 2026 花火 ch. / Pandas213 · GPL v3"
                         font: ui.theme.bodyFont
                         opacity: 0.58
                         horizontalAlignment: Text.AlignLeft
@@ -4697,6 +4889,81 @@ MuseScore {
                 }
             }
             }
+
+        Dialog {
+            id: renamePresetDialog
+            parent: Overlay.overlay
+            modal: true
+            focus: true
+            dim: true
+            closePolicy: Popup.CloseOnEscape
+            padding: 20
+            width: Math.min(460, parent ? parent.width - 32 : 460)
+            height: implicitHeight
+            x: parent ? Math.round((parent.width - width) / 2) : 0
+            y: parent ? Math.round((parent.height - height) / 2) : 0
+            implicitHeight: renamePresetContent.implicitHeight
+                            + topPadding + bottomPadding
+
+            onClosed: renamePresetErrorKey = ""
+
+            background: Rectangle {
+                color: ui.theme.backgroundPrimaryColor
+                border.width: ui.theme.borderWidth
+                border.color: ui.theme.strokeColor
+                radius: 4
+            }
+
+            contentItem: ColumnLayout {
+                id: renamePresetContent
+                spacing: 12
+
+                MU.StyledTextLabel {
+                    text: trText("dialog.renamePresetTitle")
+                    font: ui.theme.largeBodyBoldFont
+                    horizontalAlignment: Text.AlignLeft
+                    Layout.fillWidth: true
+                }
+
+                MU.TextInputField {
+                    id: renamePresetField
+                    Accessible.name: trText("label.presetName")
+                    Layout.fillWidth: true
+                    maximumLength: 48
+                    hint: trText("label.presetName")
+                    onAccepted: confirmCustomPresetRename()
+                    onEscaped: cancelCustomPresetRename()
+                    onTextChanged: renamePresetErrorKey = ""
+                }
+
+                MU.StyledTextLabel {
+                    visible: renamePresetErrorKey.length > 0
+                    text: visible ? trText(renamePresetErrorKey) : ""
+                    horizontalAlignment: Text.AlignLeft
+                    Layout.fillWidth: true
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 8
+
+                    Item {
+                        Layout.fillWidth: true
+                    }
+
+                    MU.FlatButton {
+                        text: trText("button.cancel")
+                        onClicked: cancelCustomPresetRename()
+                    }
+
+                    MU.FlatButton {
+                        text: trText("button.renameConfirm")
+                        accentButton: true
+                        onClicked: confirmCustomPresetRename()
+                    }
+                }
+            }
+        }
 
         Dialog {
             id: confirmationDialog

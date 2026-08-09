@@ -7,6 +7,11 @@ var PROFILE_ORDER = [
     "jazz", "baroque", "cinematic", "virtuosic"
 ];
 
+var STANDARD_DYNAMIC_ORDER = [
+    "ppp", "pp", "p", "mp", "mf", "f", "ff", "fff"
+];
+var DYNAMIC_TERRITORY_CROSSOVER = 3;
+
 var PROFILES = {
     subtle: {
         phrase: 1.45,
@@ -759,6 +764,98 @@ function dynamicInfoAtVelocity(value, exactVelocity) {
                             true, true);
 }
 
+function dynamicTerritory(value, centerVelocity, baselines, written) {
+    var values = normalizedBaselines(
+                baselines,
+                PRESET_CONTROLS.natural.baselines);
+    var code = normalizeDynamicCode(value);
+    var center = normalizedVelocity(centerVelocity);
+    if (center === null) {
+        center = values.mf;
+    }
+    var index = STANDARD_DYNAMIC_ORDER.indexOf(code);
+    if (index < 0) {
+        index = STANDARD_DYNAMIC_ORDER.indexOf(
+                    dynamicCodeForVelocity(center, values));
+    }
+    index = clamp(index, 0, STANDARD_DYNAMIC_ORDER.length - 1);
+
+    var current = values[STANDARD_DYNAMIC_ORDER[index]];
+    var lowerCore;
+    var upperCore;
+    if (index > 0) {
+        lowerCore = (values[STANDARD_DYNAMIC_ORDER[index - 1]] + current) / 2;
+    } else {
+        lowerCore = current
+                - (values[STANDARD_DYNAMIC_ORDER[index + 1]] - current) / 2;
+    }
+    if (index < STANDARD_DYNAMIC_ORDER.length - 1) {
+        upperCore = (current + values[STANDARD_DYNAMIC_ORDER[index + 1]]) / 2;
+    } else {
+        upperCore = current
+                + (current - values[STANDARD_DYNAMIC_ORDER[index - 1]]) / 2;
+    }
+
+    var crossover = written
+            ? DYNAMIC_TERRITORY_CROSSOVER
+            : DYNAMIC_TERRITORY_CROSSOVER + 2;
+    return {
+        code: STANDARD_DYNAMIC_ORDER[index],
+        baseline: current,
+        crossover: crossover,
+        minimum: clamp(Math.floor(lowerCore) - crossover, 1, 127),
+        maximum: clamp(Math.ceil(upperCore) + crossover, 1, 127)
+    };
+}
+
+function graceRelativeOffset(grace, event, commonDelta) {
+    grace = grace || {};
+    var count = Math.max(1, Math.round(numberOr(grace.graceChordCount, 1)));
+    var index = clamp(Math.round(numberOr(grace.graceChordIndex, 0)),
+                      0, count - 1);
+    var progress = count <= 1 ? 0.5 : index / (count - 1);
+    var kind = String(grace.graceKind || "acciaccatura");
+    var offset;
+    if (kind === "appoggiatura") {
+        var contextLift = clamp(Math.round(numberOr(commonDelta, 0) * 0.08),
+                                -1, 1);
+        var destination = -1 + contextLift;
+        offset = count <= 1
+                ? destination
+                : -3 + (destination + 3) * progress;
+    } else {
+        offset = count <= 1 ? -7 : -9 + 4 * progress;
+    }
+
+    var graceArticulation = articulationInfo(grace.articulations || []);
+    if (isTransientDynamic(event && event.dynamicCode)) {
+        return 6;
+    }
+    if (numberOr(graceArticulation.attack, 0) >= 1.65) {
+        return 5;
+    }
+    if (numberOr(graceArticulation.attack, 0) >= 0.8) {
+        return 3;
+    }
+    return Math.round(offset);
+}
+
+function nearestPrincipalTarget(grace, principalTargets) {
+    var best = principalTargets[0];
+    var bestDistance = Math.abs(numberOr(grace.pitch, 60)
+                                - numberOr(best.pitch, 60));
+    var i;
+    for (i = 1; i < principalTargets.length; ++i) {
+        var distance = Math.abs(numberOr(grace.pitch, 60)
+                                - numberOr(principalTargets[i].pitch, 60));
+        if (distance < bestDistance) {
+            best = principalTargets[i];
+            bestDistance = distance;
+        }
+    }
+    return best;
+}
+
 function copyDynamicDescriptor(event) {
     return {
         code: normalizeDynamicCode(event && event.code),
@@ -1469,10 +1566,94 @@ function spannerAppliesToEvent(spanner, event) {
             && numberOr(event.staff, 0) <= endStaff;
 }
 
-function assignSpannerContext(events, measures, slurs, hairpins) {
+function assignHairpinContext(events, hairpins, baselines) {
+    events = events || [];
+    hairpins = hairpins || [];
+    var i;
+    var j;
+    for (i = 0; i < events.length; ++i) {
+        events[i]._hairpinBaseOffset = 0;
+        events[i]._hairpinActive = false;
+    }
+
+    var hairpinAttackCount = 0;
+    for (i = 0; i < hairpins.length; ++i) {
+        var hairpin = hairpins[i];
+        var hairpinStart = numberOr(hairpin.startTick, -1);
+        var hairpinEnd = numberOr(hairpin.endTick, -1);
+        var direction = numberOr(hairpin.direction, 0) >= 0 ? 1 : -1;
+        if (hairpinStart < 0 || hairpinEnd <= hairpinStart) {
+            continue;
+        }
+
+        var firstEvent = null;
+        var eventAfter = null;
+        for (j = 0; j < events.length; ++j) {
+            var candidate = events[j];
+            if (!spannerAppliesToEvent(hairpin, candidate)) {
+                continue;
+            }
+            if (!firstEvent && numberOr(candidate.tick, 0) >= hairpinStart
+                    && numberOr(candidate.tick, 0) < hairpinEnd) {
+                firstEvent = candidate;
+            }
+            if (numberOr(candidate.tick, 0) >= hairpinEnd) {
+                eventAfter = candidate;
+                break;
+            }
+        }
+        if (!firstEvent) {
+            continue;
+        }
+
+        var startBase = dynamicInfo(
+                    firstEvent.dynamicCode,
+                    firstEvent.dynamicVelocity,
+                    baselines).velocity;
+        var configuredChange = Math.abs(numberOr(hairpin.veloChange, 0));
+        var amount = direction * (configuredChange > 0 ? configuredChange : 14);
+        if (eventAfter) {
+            var targetBase = dynamicInfo(
+                        eventAfter.dynamicCode,
+                        eventAfter.dynamicVelocity,
+                        baselines).velocity;
+            var writtenDifference = targetBase - startBase;
+            if (Math.abs(writtenDifference) >= 2
+                    && (writtenDifference > 0 ? 1 : -1) === direction) {
+                amount = writtenDifference;
+            }
+        }
+        amount = clamp(amount, -64, 64);
+
+        for (j = 0; j < events.length; ++j) {
+            var hairpinEvent = events[j];
+            if (!spannerAppliesToEvent(hairpin, hairpinEvent)
+                    || numberOr(hairpinEvent.tick, 0) < hairpinStart
+                    || numberOr(hairpinEvent.tick, 0) >= hairpinEnd) {
+                continue;
+            }
+            var progress = clamp(
+                        (numberOr(hairpinEvent.tick, 0) - hairpinStart)
+                        / Math.max(1, hairpinEnd - hairpinStart),
+                        0,
+                        1);
+            var eased = progress * progress * (3 - 2 * progress);
+            hairpinEvent._hairpinBaseOffset = clamp(
+                        numberOr(hairpinEvent._hairpinBaseOffset, 0)
+                        + amount * eased,
+                        -64,
+                        64);
+            hairpinEvent._hairpinActive = true;
+            ++hairpinAttackCount;
+        }
+    }
+
+    return hairpinAttackCount;
+}
+
+function assignSpannerContext(events, measures, slurs, hairpins, baselines) {
     events = events || [];
     slurs = slurs || [];
-    hairpins = hairpins || [];
     var i;
     var j;
     for (i = 0; i < events.length; ++i) {
@@ -1480,8 +1661,6 @@ function assignSpannerContext(events, measures, slurs, hairpins) {
         events[i]._slurPosition = 0;
         events[i]._slurStarts = false;
         events[i]._slurEnds = false;
-        events[i]._hairpinBaseOffset = 0;
-        events[i]._hairpinActive = false;
     }
 
     var slurredAttackCount = 0;
@@ -1523,79 +1702,10 @@ function assignSpannerContext(events, measures, slurs, hairpins) {
         }
     }
 
-    var hairpinAttackCount = 0;
-    for (i = 0; i < hairpins.length; ++i) {
-        var hairpin = hairpins[i];
-        var hairpinStart = numberOr(hairpin.startTick, -1);
-        var hairpinEnd = numberOr(hairpin.endTick, -1);
-        var direction = numberOr(hairpin.direction, 0) >= 0 ? 1 : -1;
-        if (hairpinStart < 0 || hairpinEnd <= hairpinStart) {
-            continue;
-        }
-
-        var firstEvent = null;
-        var eventAfter = null;
-        for (j = 0; j < events.length; ++j) {
-            var candidate = events[j];
-            if (!spannerAppliesToEvent(hairpin, candidate)) {
-                continue;
-            }
-            if (!firstEvent && numberOr(candidate.tick, 0) >= hairpinStart
-                    && numberOr(candidate.tick, 0) < hairpinEnd) {
-                firstEvent = candidate;
-            }
-            if (numberOr(candidate.tick, 0) >= hairpinEnd) {
-                eventAfter = candidate;
-                break;
-            }
-        }
-        if (!firstEvent) {
-            continue;
-        }
-
-        var startBase = dynamicInfo(
-                    firstEvent.dynamicCode,
-                    firstEvent.dynamicVelocity).velocity;
-        var configuredChange = Math.abs(numberOr(hairpin.veloChange, 0));
-        var amount = direction * (configuredChange > 0 ? configuredChange : 14);
-        if (eventAfter) {
-            var targetBase = dynamicInfo(
-                        eventAfter.dynamicCode,
-                        eventAfter.dynamicVelocity).velocity;
-            var writtenDifference = targetBase - startBase;
-            if (Math.abs(writtenDifference) >= 2
-                    && (writtenDifference > 0 ? 1 : -1) === direction) {
-                amount = writtenDifference;
-            }
-        }
-        amount = clamp(amount, -64, 64);
-
-        for (j = 0; j < events.length; ++j) {
-            var hairpinEvent = events[j];
-            if (!spannerAppliesToEvent(hairpin, hairpinEvent)
-                    || numberOr(hairpinEvent.tick, 0) < hairpinStart
-                    || numberOr(hairpinEvent.tick, 0) >= hairpinEnd) {
-                continue;
-            }
-            var progress = clamp(
-                        (numberOr(hairpinEvent.tick, 0) - hairpinStart)
-                        / Math.max(1, hairpinEnd - hairpinStart),
-                        0,
-                        1);
-            var eased = progress * progress * (3 - 2 * progress);
-            hairpinEvent._hairpinBaseOffset = clamp(
-                        numberOr(hairpinEvent._hairpinBaseOffset, 0)
-                        + amount * eased,
-                        -64,
-                        64);
-            hairpinEvent._hairpinActive = true;
-            ++hairpinAttackCount;
-        }
-    }
-
     return {
         slurredAttackCount: slurredAttackCount,
-        hairpinAttackCount: hairpinAttackCount
+        hairpinAttackCount: assignHairpinContext(
+                    events, hairpins, baselines)
     };
 }
 
@@ -2502,6 +2612,8 @@ function inferDynamicPlan(events, measures, dynamicEvents, character,
                             + (nextAnchor.velocity - target)
                               * smoothStep(approach);
                 }
+            } else if (event._hairpinActive) {
+                target = written;
             } else {
                 target = naturalSingleLevel
                         && !isTransientDynamic(event.dynamicCode)
@@ -4845,22 +4957,7 @@ function contextAwareDynamicTransitions(events, measures, division, enabled,
                 --startGroupIndex;
             }
 
-            var preAttackGroupCount = groupIndex - startGroupIndex;
             var endGroupIndex = groupIndex;
-            if (preAttackGroupCount < 4) {
-                var desiredAdditional = 4 - preAttackGroupCount;
-                var futureIndex = groupIndex + 1;
-                while (futureIndex < groups.length && desiredAdditional > 0
-                        && groups[futureIndex].tick
-                           <= targetGroup.tick + windowTicks * 0.65
-                        && dynamicSourceSignature(
-                               groups[futureIndex].events[0], baselines)
-                           === dynamicSourceSignature(targetEvent, baselines)) {
-                    endGroupIndex = futureIndex;
-                    --desiredAdditional;
-                    ++futureIndex;
-                }
-            }
 
             if (endGroupIndex - startGroupIndex + 1 < 3) {
                 ++result.preservedStepCount;
@@ -5019,8 +5116,7 @@ function structuralDetailComponent(event, measure) {
         result -= 0.16;
     }
     if (event._sameChordRepeat) {
-        result -= Math.min(0.26,
-                           0.05 + numberOr(event._repeatStreak, 0) * 0.035);
+        result -= 0.12;
     }
     var previousDuration = Math.max(1, numberOr(
                     event._previousDurationTicks,
@@ -5251,7 +5347,8 @@ function analyze(data, rawOptions) {
                 events,
                 measures,
                 data.slurs,
-                data.hairpins);
+                [],
+                options.baselines);
 
     populateMeasureStats(measures, events, positionByIndex);
     var character = classifyPieceCharacter(
@@ -5262,6 +5359,10 @@ function analyze(data, rawOptions) {
                 data.division);
     options = applyNaturalCalibration(options, character);
     profile = options.profile;
+    spannerAssignment.hairpinAttackCount = assignHairpinContext(
+                events,
+                data.hairpins,
+                options.baselines);
     analyzeMeasurePatterns(measures);
     computeChangeScores(measures);
 
@@ -5322,6 +5423,7 @@ function analyze(data, rawOptions) {
     var baseVelocities = {};
     var changedCount = 0;
     var consideredCount = 0;
+    var graceConsideredCount = 0;
     var dynamicCounts = {};
     var coverageByMeasure = {};
     var strengthScale = options.strength / 60;
@@ -5344,6 +5446,34 @@ function analyze(data, rawOptions) {
                     1,
                     127);
         var info = dynamicInfoAtVelocity(event.dynamicCode, effectiveBase);
+        var transientDynamic = isTransientDynamic(event.dynamicCode);
+        var territoryCode = writtenInfo.code;
+        if (event._dynamicTransitionActive || event._hairpinActive
+                || !event.hasWrittenDynamic
+                || Math.abs(effectiveBase - writtenInfo.velocity)
+                   > DYNAMIC_TERRITORY_CROSSOVER) {
+            territoryCode = dynamicCodeForVelocity(
+                        effectiveBase, options.baselines);
+        }
+        var territory = options.dynamicHeadroom && !transientDynamic
+                ? dynamicTerritory(
+                      territoryCode,
+                      effectiveBase,
+                      options.baselines,
+                      event.hasWrittenDynamic)
+                : null;
+        var writtenSteadyArrival = event.hasWrittenDynamic
+                && !transientDynamic
+                && numberOr(event.tick, -2)
+                   === numberOr(event.dynamicSourceTick, -1);
+        var territoryMinimum = territory ? territory.minimum : 1;
+        var territoryMaximum = territory ? territory.maximum : 127;
+        if (territory && writtenSteadyArrival) {
+            territoryMinimum = Math.max(
+                        territoryMinimum, writtenInfo.velocity - 4);
+            territoryMaximum = Math.min(
+                        territoryMaximum, writtenInfo.velocity + 5);
+        }
         var dynamicKey = event.hasWrittenDynamic
                 ? (writtenInfo.code === "custom"
                    ? "custom@" + String(writtenInfo.velocity)
@@ -5365,7 +5495,7 @@ function analyze(data, rawOptions) {
                 && numberOr(event.tick, -2)
                    === numberOr(event.dynamicSourceTick, -1)) {
             // 書かれた強弱の開始音では、全体推定より記号を優先
-            eventBase *= isTransientDynamic(event.dynamicCode) ? 0.72 : 0.48;
+            eventBase *= transientDynamic ? 0.72 : 0.32;
         }
 
         var maxUp = capForStrength(profile.maxUp, strengthScale);
@@ -5377,23 +5507,20 @@ function analyze(data, rawOptions) {
             maxDown = Math.min(maxDown, info.maxDown);
         }
 
+        var performanceScale = strengthScale * info.scale
+                * numberOr(profile.gain, 1)
+                * numberOr(expression.variationScale, 1)
+                * numberOr(articulation.variationScale, 1)
+                * tempoVariationScale(event, tempoCenter);
+        var eventCommonDelta = Math.round(clamp(
+                    eventBase * performanceScale,
+                    -maxDown,
+                    maxUp));
         var notes = event.notes || [];
+        var principalTargets = [];
         var j;
         for (j = 0; j < notes.length; ++j) {
             var note = notes[j];
-            if (note.tied || !note.key) {
-                continue;
-            }
-
-            var performanceScale = strengthScale * info.scale
-                    * numberOr(profile.gain, 1)
-                    * numberOr(expression.variationScale, 1)
-                    * numberOr(articulation.variationScale, 1)
-                    * tempoVariationScale(event, tempoCenter);
-            var commonDelta = Math.round(clamp(
-                        eventBase * performanceScale,
-                        -maxDown,
-                        maxUp));
             var voicingDelta = Math.round(noteVoicingComponent(
                         event, note, options, profile) * performanceScale);
             if (strengthScale > 0 && numberOr(event._attackedCount, 0) > 1) {
@@ -5406,8 +5533,20 @@ function analyze(data, rawOptions) {
             }
             var delta = strengthScale <= 0
                     ? 0
-                    : Math.round(clamp(commonDelta + voicingDelta,
+                    : Math.round(clamp(eventCommonDelta + voicingDelta,
                                        -maxDown, maxUp));
+            var target = clamp(info.velocity + delta, 1, 127);
+            if (territory) {
+                target = clamp(target, territoryMinimum, territoryMaximum);
+                delta = target - info.velocity;
+            }
+            principalTargets.push({
+                pitch: numberOr(note.pitch, 60),
+                target: target
+            });
+            if (note.tied || !note.key) {
+                continue;
+            }
             deltas[note.key] = delta;
             baseVelocities[note.key] = info.velocity;
             ++consideredCount;
@@ -5424,6 +5563,54 @@ function analyze(data, rawOptions) {
             if (delta !== 0) {
                 ++changedCount;
                 ++coverage.changed;
+            }
+        }
+
+        var graceNotes = event.graceNotes || [];
+        for (j = 0; j < graceNotes.length; ++j) {
+            var grace = graceNotes[j];
+            if (grace.tied || !grace.key || principalTargets.length === 0) {
+                continue;
+            }
+            var principal = nearestPrincipalTarget(grace, principalTargets);
+            var graceTarget = principal.target
+                    + graceRelativeOffset(grace, event, eventCommonDelta);
+            var graceChordNoteCount = Math.max(
+                        1, Math.round(numberOr(grace.graceChordNoteCount, 1)));
+            if (graceChordNoteCount > 1) {
+                var graceChordNoteIndex = clamp(
+                            Math.round(numberOr(
+                                           grace.graceChordNoteIndex, 0)),
+                            0, graceChordNoteCount - 1);
+                graceTarget += Math.round(
+                            (graceChordNoteIndex
+                             / (graceChordNoteCount - 1) - 0.5) * 2);
+            }
+            graceTarget = clamp(Math.round(graceTarget), 1, 127);
+            if (territory) {
+                graceTarget = clamp(
+                            graceTarget,
+                            territory.minimum,
+                            territory.maximum);
+            }
+            var graceDelta = graceTarget - info.velocity;
+            deltas[grace.key] = graceDelta;
+            baseVelocities[grace.key] = info.velocity;
+            ++consideredCount;
+            ++graceConsideredCount;
+
+            var graceCoverageKey = String(event._measurePosition);
+            if (!own(coverageByMeasure, graceCoverageKey)) {
+                coverageByMeasure[graceCoverageKey] = {
+                    considered: 0,
+                    changed: 0
+                };
+            }
+            var graceCoverage = coverageByMeasure[graceCoverageKey];
+            ++graceCoverage.considered;
+            if (graceDelta !== 0) {
+                ++changedCount;
+                ++graceCoverage.changed;
             }
         }
     }
@@ -5490,6 +5677,7 @@ function analyze(data, rawOptions) {
         deltas: deltas,
         baseVelocities: baseVelocities,
         consideredCount: consideredCount,
+        graceConsideredCount: graceConsideredCount,
         changedCount: changedCount,
         processedMeasureCount: processedMeasureCount,
         changedMeasureCount: changedMeasureCount,
